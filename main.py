@@ -3,11 +3,13 @@
 Project: MiNote-Sync Core (核心逻辑库)
 Author: Ning (willingning-coder)
 Date: 2025-12-29
-Version: 1.1.0 (Refactored)
+Version: 1.2.1 (Hotfix)
 
-Description:
-    纯净的逻辑处理核心，负责与小米服务器通信、数据清洗及文件写入。
-    不包含任何 GUI 代码，可被 CLI 或 GUI 独立调用。
+Changelog:
+    v1.2.1:
+      - 修复: 移除 YAML Frontmatter 中硬编码的 "author: Ning"。
+      - 修复: 增加针对 "text indent" 等 CSS 残留代码的清洗逻辑。
+      - 优化: 标题生成时同步清洗垃圾代码，防止文件名出现代码。
 """
 
 import json
@@ -21,23 +23,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 class MiNoteSyncCore:
     def __init__(self, cookie, save_path, log_callback=None):
-        """
-        :param cookie: 小米云服务 Cookie
-        :param save_path: 笔记保存根目录
-        :param log_callback: 日志回调函数 (接收 str 参数)
-        """
         self.cookie = cookie
         self.vault_root = save_path
         self.assets_dir = os.path.join(save_path, "assets")
         self.log_callback = log_callback or print
-        self.stop_flag = False  # 停止标志位
+        self.stop_flag = False
 
     def log(self, message):
-        """统一日志出口"""
         self.log_callback(message)
 
     def stop(self):
-        """外部调用此方法以中断同步"""
         self.stop_flag = True
         self.log("⚠️ 收到停止指令，正在结束当前任务...")
 
@@ -50,7 +45,6 @@ class MiNoteSyncCore:
         }
 
     def request_with_retry(self, url, retries=3, stream=False):
-        """指数退避重试网络请求"""
         for i in range(retries):
             if self.stop_flag: return None
             try:
@@ -76,21 +70,51 @@ class MiNoteSyncCore:
         if not os.path.exists(self.vault_root): os.makedirs(self.vault_root)
         if not os.path.exists(self.assets_dir): os.makedirs(self.assets_dir)
 
+    def clean_css_garbage(self, text):
+        """【新增】专门处理 CSS 样式残留和特定垃圾词"""
+        if not text: return ""
+        # 去除 "text indent=1" 或 "text indent=1cpu" 这种连体怪
+        # 逻辑：匹配 text indent=数字，可能后面紧跟字符
+        text = re.sub(r'text\s*indent\s*=\s*\d+', '', text, flags=re.IGNORECASE)
+        # 去除常见的 class 定义残留
+        text = re.sub(r'class="[^"]+"', '', text)
+        text = re.sub(r'style="[^"]+"', '', text)
+        return text
+
     def sanitize_filename(self, name):
         if not name: return "未命名"
+        
+        # 1. 先清洗垃圾代码，防止文件名里带代码
+        name = self.clean_css_garbage(name)
+        
+        # 2. 常规文件系统清洗
         name = re.sub(r'[\x00-\x1f]', '', name)
-        # 限制长度为 50，防止 Windows 路径溢出
-        return re.sub(r'[\\/*?:"<>|]', "", name).replace('\n', ' ').strip()[:50]
+        name = re.sub(r'[\\/*?:"<>|]', "", name).replace('\n', ' ').strip()
+        
+        # 3. 长度控制 (Windows 路径保护)
+        return name[:50]
 
     def clean_content(self, content):
         """HTML/XML 深度清洗"""
         if not content: return ""
+        
+        # 1. 结构化替换
         content = content.replace("<br>", "\n").replace("<br/>", "\n")
         content = content.replace("</div>", "\n").replace("</p>", "\n")
+        
+        # 2. 移除特定干扰标签保留内容
         content = re.sub(r'<text[^>]*>(.*?)</text>', r'\1', content, flags=re.S)
         content = re.sub(r'<background[^>]*>(.*?)</background>', r'\1', content, flags=re.S)
+        
+        # 3. 暴力移除标签
         content = re.sub(r'<[^>]+>', '', content)
+        
+        # 4. 【新增】CSS 垃圾词清洗
+        content = self.clean_css_garbage(content)
+        
+        # 5. 实体解码
         content = html.unescape(content)
+        
         return content.strip()
 
     def get_real_extension(self, response):
@@ -104,7 +128,6 @@ class MiNoteSyncCore:
         return ".jpg"
 
     def download_resource(self, fid):
-        # 增量检查
         for ext in [".jpg", ".png", ".gif", ".mp3", ".amr", ".wav", ".m4a", ".webp"]:
             fname = f"{fid}{ext}"
             fpath = os.path.join(self.assets_dir, fname)
@@ -141,13 +164,11 @@ class MiNoteSyncCore:
             if sync_tag: url += f"&syncTag={sync_tag}"
             
             r = self.request_with_retry(url)
-            if not r: break # 重试耗尽或 Cookie 失效
+            if not r: break
             
             try:
                 json_data = r.json()
                 data = json_data.get('data', {})
-                
-                # 更新文件夹映射
                 for f in data.get('folders', []):
                     folders_map[str(f.get('id'))] = f.get('subject')
                 
@@ -159,7 +180,6 @@ class MiNoteSyncCore:
                 
                 sync_tag = data.get('syncTag')
                 if not sync_tag or current_page >= 500: break
-                
                 time.sleep(0.5)
             except Exception as e:
                 self.log(f"❌ 解析列表失败: {e}")
@@ -175,7 +195,6 @@ class MiNoteSyncCore:
         return None
 
     def process_single_note(self, args):
-        """单个任务处理函数 (由线程池调用)"""
         if self.stop_flag: return
 
         entry, folder_map = args
@@ -189,18 +208,18 @@ class MiNoteSyncCore:
             try: extra = json.loads(entry.get('extraInfo', '{}'))
             except: pass
             
+            # 1. 提取标题
             title = extra.get('title') or entry.get('snippet', '无标题')
+            # 【重要】标题也要进行深度清洗，防止 "text indent" 出现在文件名里
             title = self.sanitize_filename(title)
-            if not title: title = f"无标题"
+            if not title: title = "无标题"
             
             date_str = time.strftime("%Y%m%d", time.localtime(entry['createDate']/1000))
             target_dir = os.path.join(self.vault_root, self.sanitize_filename(folder_name))
             
-            # 【重要优化】防止文件名冲突：添加 ID 后4位
             filename = f"{date_str}_{title}_{str(nid)[-4:]}.md"
             md_path = os.path.join(target_dir, filename)
             
-            # 增量跳过
             if os.path.exists(md_path) and os.path.getsize(md_path) > 0:
                 self.log(f"    ⏭️ [跳过] {title}")
                 return 
@@ -213,7 +232,7 @@ class MiNoteSyncCore:
             content = full_note.get('content', '')
             if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
             
-            # --- 资源提取逻辑 ---
+            # --- 资源提取 ---
             ids = set()
             ids.update(re.findall(r'fileid=["\']?([\w\.\-]+)["\']?', content, re.I))
             ids.update(re.findall(r'☺\s*([\w\.\-]+)', content))
@@ -236,7 +255,7 @@ class MiNoteSyncCore:
                 fname = self.download_resource(fid)
                 if fname: replacements[fid] = f"![[{fname}]]"
 
-            # --- 内容替换 ---
+            # --- 内容清洗 ---
             content = self.clean_content(content)
             for fid, link in replacements.items():
                 content = re.sub(fr'<sound[^>]*{re.escape(fid)}[^>]*\/?>', f"\n{link}\n", content)
@@ -254,18 +273,18 @@ class MiNoteSyncCore:
                             appended = True
                         content += f"{replacements[vid]}\n"
 
-            # --- 文件写入 ---
+            # --- 文件写入 (移除了 author) ---
             ctime_struct = time.localtime(full_note['createDate']/1000)
             mtime_struct = time.localtime(full_note['modifyDate']/1000)
             ctime_str = time.strftime("%Y-%m-%d %H:%M:%S", ctime_struct)
             mtime_str = time.strftime("%Y-%m-%d %H:%M:%S", mtime_struct)
             
-            md_text = f"---\nid: {nid}\ncreated: {ctime_str}\nupdated: {mtime_str}\ntitle: \"{title}\"\nfolder: \"{folder_name}\"\nauthor: Ning\n---\n\n# {title}\n\n{content}\n"
+            # 【修复】移除了 author: Ning
+            md_text = f"---\nid: {nid}\ncreated: {ctime_str}\nupdated: {mtime_str}\ntitle: \"{title}\"\nfolder: \"{folder_name}\"\n---\n\n{content}\n"
             
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(md_text)
                 
-            # --- 时间戳修改 ---
             try:
                 mtime_ts = full_note['modifyDate'] / 1000.0
                 os.utime(md_path, (mtime_ts, mtime_ts))
@@ -276,7 +295,6 @@ class MiNoteSyncCore:
         except Exception as e:
             self.log(f"    ❌ [错误] 处理笔记 {nid} 失败: {e}")
 
-# CLI 入口兼容
 def main():
     print("请运行 gui.py 或自行调用 MiNoteSyncCore 类")
 
