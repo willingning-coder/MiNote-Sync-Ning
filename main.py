@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Project: MiNote-Sync Pro (小米笔记同步助手)
+Project: MiNote-Sync Core (核心逻辑库)
 Author: Ning (willingning-coder)
 Date: 2025-12-29
-Version: 1.1.0 (Robust Edition)
+Version: 1.1.0 (Refactored)
 
-Changelog:
-    v1.1.0: 
-      - 修复 HTML 标签清洗不彻底导致“垃圾信息”残留的问题。
-      - 新增文件系统时间戳同步 (os.utime)，让文件修改时间回归笔记真实时间。
-      - 新增指数退避重试机制 (Exponential Backoff)，彻底解决“无法获取详情”的网络波动报错。
-    v1.0.2: 
-      - 修复列表抓取死循环。
+Description:
+    纯净的逻辑处理核心，负责与小米服务器通信、数据清洗及文件写入。
+    不包含任何 GUI 代码，可被 CLI 或 GUI 独立调用。
 """
 
 import json
@@ -23,313 +19,266 @@ import html
 import random
 from concurrent.futures import ThreadPoolExecutor
 
-# ================= 1. 配置区 =================
+class MiNoteSyncCore:
+    def __init__(self, cookie, save_path, log_callback=None):
+        """
+        :param cookie: 小米云服务 Cookie
+        :param save_path: 笔记保存根目录
+        :param log_callback: 日志回调函数 (接收 str 参数)
+        """
+        self.cookie = cookie
+        self.vault_root = save_path
+        self.assets_dir = os.path.join(save_path, "assets")
+        self.log_callback = log_callback or print
+        self.stop_flag = False  # 停止标志位
 
-BASE_DIR = os.getcwd()
-VAULT_ROOT = os.path.join(BASE_DIR, "Data", "Notes")
-ASSETS_DIR = os.path.join(VAULT_ROOT, "assets")
+    def log(self, message):
+        """统一日志出口"""
+        self.log_callback(message)
 
-# Cookie 全局变量
-COOKIE = "" 
+    def stop(self):
+        """外部调用此方法以中断同步"""
+        self.stop_flag = True
+        self.log("⚠️ 收到停止指令，正在结束当前任务...")
 
-# ================= 2. 核心工具库 =================
+    def get_headers(self):
+        return {
+            "Cookie": self.cookie,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Referer": "https://i.mi.com/note/h5",
+            "Origin": "https://i.mi.com"
+        }
 
-def get_headers():
-    global COOKIE
-    if not COOKIE:
-        print("\n" + "="*50)
-        print("🔒 为了保护隐私，请手动输入 Cookie")
-        print("   1. 登录 https://i.mi.com/note/h5")
-        print("   2. 按 F12 打开控制台 -> 网络(Network)")
-        print("   3. 刷新页面，点击任意请求，复制请求头中的 Cookie")
-        print("="*50)
-        COOKIE = input("👉 请粘贴 Cookie 并回车: ").strip()
-    
-    return {
-        "Cookie": COOKIE,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-        "Referer": "https://i.mi.com/note/h5",
-        "Origin": "https://i.mi.com"
-    }
-
-def request_with_retry(url, headers, retries=3, stream=False):
-    """
-    【高阶修复】指数退避重试机制
-    解决 Issue #1: "同步过程中出现警告无法获取详情"
-    原理：失败后等待 1s, 2s, 4s... 避免因网络抖动直接熔断
-    """
-    for i in range(retries):
-        try:
-            response = requests.get(url, headers=headers, stream=stream, timeout=15)
-            # 针对 API 限制的 403/429/502 错误进行特定重试
-            if response.status_code in [200, 404]:
-                return response
-            elif response.status_code in [403, 429, 500, 502, 503]:
-                raise ValueError(f"Server Error {response.status_code}")
-        except Exception as e:
-            wait_time = (1 * (2 ** i)) + random.uniform(0, 1) # 增加随机抖动
-            if i < retries - 1:
-                print(f"    ⚠️ 请求不稳定，{wait_time:.1f}秒后重试... ({e})")
-                time.sleep(wait_time)
-            else:
-                print(f"    ❌ 重试耗尽，请求失败: {url}")
-                return None
-    return None
-
-def setup_dirs():
-    if not os.path.exists(VAULT_ROOT): os.makedirs(VAULT_ROOT)
-    if not os.path.exists(ASSETS_DIR): os.makedirs(ASSETS_DIR)
-
-def sanitize_filename(name):
-    if not name: return "未命名"
-    # 移除不可见字符和非法路径字符
-    name = re.sub(r'[\x00-\x1f]', '', name)
-    return re.sub(r'[\\/*?:"<>|]', "", name).replace('\n', ' ').strip()[:80]
-
-def clean_content(content):
-    """
-    【高阶修复】深度清洗 HTML/XML 垃圾代码
-    解决 Issue #2: "同步好的文件依然有垃圾信息"
-    """
-    if not content: return ""
-    
-    # 1. 将 HTML 换行符转换为 Markdown 换行
-    content = content.replace("<br>", "\n").replace("<br/>", "\n")
-    content = content.replace("</div>", "\n").replace("</p>", "\n")
-    
-    # 2. 移除特定标签保留内容 (如 text, background)
-    content = re.sub(r'<text[^>]*>(.*?)</text>', r'\1', content, flags=re.S)
-    content = re.sub(r'<background[^>]*>(.*?)</background>', r'\1', content, flags=re.S)
-    
-    # 3. 暴力移除所有剩余的 <xxx> 标签 (清理 div, font, span 等)
-    content = re.sub(r'<[^>]+>', '', content)
-    
-    # 4. 解码 HTML 实体 (如 &nbsp; -> 空格, &lt; -> <)
-    content = html.unescape(content)
-    
-    return content.strip()
-
-def get_real_extension(response):
-    ctype = response.headers.get("Content-Type", "").lower()
-    if "amr" in ctype: return ".amr"
-    if "wav" in ctype: return ".wav"
-    if "mpeg" in ctype or "mp3" in ctype or "audio" in ctype: return ".mp3"
-    if "png" in ctype: return ".png"
-    if "gif" in ctype: return ".gif"
-    if "jpeg" in ctype or "jpg" in ctype: return ".jpg"
-    return ".jpg"
-
-# ================= 3. 业务逻辑区 =================
-
-def download_resource(fid):
-    # 增量跳过检查
-    for ext in [".jpg", ".png", ".gif", ".mp3", ".amr", ".wav", ".m4a", ".webp"]:
-        fname = f"{fid}{ext}"
-        fpath = os.path.join(ASSETS_DIR, fname)
-        if os.path.exists(fpath) and os.path.getsize(fpath) > 1000:
-            return fname
-
-    headers = get_headers()
-    types = ["note_img", "file", "note_voice", "note_audio"]
-    
-    for tp in types:
-        url = f"https://i.mi.com/file/full?type={tp}&fileid={fid}"
-        # 使用重试机制下载资源
-        r = request_with_retry(url, headers, retries=2, stream=True)
-        if r and r.status_code == 200:
-            if int(r.headers.get('content-length', 0)) < 1000: continue
-            real_ext = get_real_extension(r)
-            fname = f"{fid}{real_ext}"
+    def request_with_retry(self, url, retries=3, stream=False):
+        """指数退避重试网络请求"""
+        for i in range(retries):
+            if self.stop_flag: return None
             try:
-                with open(os.path.join(ASSETS_DIR, fname), "wb") as f:
-                    for chunk in r.iter_content(1024): f.write(chunk)
-                return fname
+                response = requests.get(url, headers=self.get_headers(), stream=stream, timeout=15)
+                if response.status_code in [200, 404]:
+                    return response
+                elif response.status_code == 401:
+                    self.log("❌ Cookie 已失效 (401 Unauthorized)")
+                    return None
+                elif response.status_code in [403, 429, 500, 502, 503]:
+                    raise ValueError(f"Server Error {response.status_code}")
             except Exception as e:
-                print(f"    ⚠️ 写入资源失败: {e}")
-    return None
+                wait_time = (1 * (2 ** i)) + random.uniform(0, 1)
+                if i < retries - 1:
+                    self.log(f"    ⚠️ 网络抖动，{wait_time:.1f}s 后重试... ({e})")
+                    time.sleep(wait_time)
+                else:
+                    self.log(f"    ❌ 请求最终失败: {url}")
+                    return None
+        return None
 
-def fetch_note_list():
-    print("📡 正在连接小米云服务...")
-    headers = get_headers()
-    all_entries = []
-    folders_map = {'0': '未分类'}
-    sync_tag = None
-    max_pages = 500 
-    current_page = 0
-    
-    while True:
-        current_page += 1
-        url = f"https://i.mi.com/note/full/page/?limit=200&ts={int(time.time()*1000)}"
-        if sync_tag: url += f"&syncTag={sync_tag}"
+    def setup_dirs(self):
+        if not os.path.exists(self.vault_root): os.makedirs(self.vault_root)
+        if not os.path.exists(self.assets_dir): os.makedirs(self.assets_dir)
+
+    def sanitize_filename(self, name):
+        if not name: return "未命名"
+        name = re.sub(r'[\x00-\x1f]', '', name)
+        # 限制长度为 50，防止 Windows 路径溢出
+        return re.sub(r'[\\/*?:"<>|]', "", name).replace('\n', ' ').strip()[:50]
+
+    def clean_content(self, content):
+        """HTML/XML 深度清洗"""
+        if not content: return ""
+        content = content.replace("<br>", "\n").replace("<br/>", "\n")
+        content = content.replace("</div>", "\n").replace("</p>", "\n")
+        content = re.sub(r'<text[^>]*>(.*?)</text>', r'\1', content, flags=re.S)
+        content = re.sub(r'<background[^>]*>(.*?)</background>', r'\1', content, flags=re.S)
+        content = re.sub(r'<[^>]+>', '', content)
+        content = html.unescape(content)
+        return content.strip()
+
+    def get_real_extension(self, response):
+        ctype = response.headers.get("Content-Type", "").lower()
+        if "amr" in ctype: return ".amr"
+        if "wav" in ctype: return ".wav"
+        if "mpeg" in ctype or "mp3" in ctype or "audio" in ctype: return ".mp3"
+        if "png" in ctype: return ".png"
+        if "gif" in ctype: return ".gif"
+        if "jpeg" in ctype or "jpg" in ctype: return ".jpg"
+        return ".jpg"
+
+    def download_resource(self, fid):
+        # 增量检查
+        for ext in [".jpg", ".png", ".gif", ".mp3", ".amr", ".wav", ".m4a", ".webp"]:
+            fname = f"{fid}{ext}"
+            fpath = os.path.join(self.assets_dir, fname)
+            if os.path.exists(fpath) and os.path.getsize(fpath) > 1000:
+                return fname
+
+        types = ["note_img", "file", "note_voice", "note_audio"]
+        for tp in types:
+            if self.stop_flag: return None
+            url = f"https://i.mi.com/file/full?type={tp}&fileid={fid}"
+            r = self.request_with_retry(url, retries=2, stream=True)
+            if r and r.status_code == 200:
+                if int(r.headers.get('content-length', 0)) < 1000: continue
+                real_ext = self.get_real_extension(r)
+                fname = f"{fid}{real_ext}"
+                try:
+                    with open(os.path.join(self.assets_dir, fname), "wb") as f:
+                        for chunk in r.iter_content(1024): f.write(chunk)
+                    return fname
+                except Exception as e:
+                    self.log(f"    ⚠️ 资源写入失败: {e}")
+        return None
+
+    def fetch_note_list(self):
+        self.log("📡 正在连接小米云服务...")
+        all_entries = []
+        folders_map = {'0': '未分类'}
+        sync_tag = None
+        current_page = 0
         
-        # 使用重试机制获取列表
-        r = request_with_retry(url, headers)
-        
-        if not r:
-            print("❌ 网络连接严重错误，无法获取列表。")
-            break
+        while not self.stop_flag:
+            current_page += 1
+            url = f"https://i.mi.com/note/full/page/?limit=200&ts={int(time.time()*1000)}"
+            if sync_tag: url += f"&syncTag={sync_tag}"
             
-        if r.status_code == 401:
-            print("❌ Cookie 已失效，请重新获取！")
-            return None, None
-        
-        try:
-            json_data = r.json()
-            data = json_data.get('data', {})
+            r = self.request_with_retry(url)
+            if not r: break # 重试耗尽或 Cookie 失效
             
-            for f in data.get('folders', []):
-                folders_map[str(f.get('id'))] = f.get('subject')
-            
-            entries = data.get('entries', [])
-            if not entries:
-                print("    ✅ 已到达最后一页，停止抓取列表。")
+            try:
+                json_data = r.json()
+                data = json_data.get('data', {})
+                
+                # 更新文件夹映射
+                for f in data.get('folders', []):
+                    folders_map[str(f.get('id'))] = f.get('subject')
+                
+                entries = data.get('entries', [])
+                if not entries: break
+                
+                all_entries.extend(entries)
+                self.log(f"    已索引 {len(all_entries)} 条笔记 (第 {current_page} 页)...")
+                
+                sync_tag = data.get('syncTag')
+                if not sync_tag or current_page >= 500: break
+                
+                time.sleep(0.5)
+            except Exception as e:
+                self.log(f"❌ 解析列表失败: {e}")
                 break
-            
-            all_entries.extend(entries)
-            print(f"    已索引 {len(all_entries)} 条笔记 (第 {current_page} 页)...")
-            
-            sync_tag = data.get('syncTag')
-            if not sync_tag or current_page >= max_pages: 
-                break
-            
-            time.sleep(0.5) # 基础限流
-        except Exception as e:
-            print(f"❌ 解析列表数据失败: {e}")
-            break
-            
-    return all_entries, folders_map
+        
+        return all_entries, folders_map
 
-def fetch_note_detail(note_id):
-    url = f"https://i.mi.com/note/note/{note_id}/?ts={int(time.time()*1000)}"
-    # 使用重试机制
-    r = request_with_retry(url, get_headers(), retries=3)
-    if r and r.status_code == 200:
-        return r.json().get('data', {}).get('entry')
-    return None
+    def fetch_note_detail(self, note_id):
+        url = f"https://i.mi.com/note/note/{note_id}/?ts={int(time.time()*1000)}"
+        r = self.request_with_retry(url, retries=3)
+        if r and r.status_code == 200:
+            return r.json().get('data', {}).get('entry')
+        return None
 
-def process_single_note(args):
-    """单条笔记处理流程"""
-    try:
+    def process_single_note(self, args):
+        """单个任务处理函数 (由线程池调用)"""
+        if self.stop_flag: return
+
         entry, folder_map = args
         nid = entry['id']
         
-        # 1. 基础元数据提取
-        folder_id = str(entry.get('folderId', '0'))
-        folder_name = folder_map.get(folder_id, "未分类")
-        
-        extra = {}
-        try: extra = json.loads(entry.get('extraInfo', '{}'))
-        except: pass
-        
-        title = extra.get('title') or entry.get('snippet', '无标题')
-        title = sanitize_filename(title)
-        if not title: title = f"无标题_{nid}"
-        
-        # 2. 准备文件路径
-        date_str = time.strftime("%Y%m%d", time.localtime(entry['createDate']/1000))
-        target_dir = os.path.join(VAULT_ROOT, sanitize_filename(folder_name))
-        md_path = os.path.join(target_dir, f"{date_str}_{title}.md")
-        
-        # 3. 增量检测 (如果本地已存在且文件大小>0，跳过)
-        if os.path.exists(md_path) and os.path.getsize(md_path) > 0:
-            print(f"    ⏭️ [跳过] 本地已存在: {title}")
-            return 
+        try:
+            folder_id = str(entry.get('folderId', '0'))
+            folder_name = folder_map.get(folder_id, "未分类")
             
-        # 4. 获取详情 (含重试)
-        full_note = fetch_note_detail(nid)
-        if not full_note: 
-            print(f"    ⚠️ [警告] 无法获取详情 (重试耗尽): {title}")
-            return
+            extra = {}
+            try: extra = json.loads(entry.get('extraInfo', '{}'))
+            except: pass
+            
+            title = extra.get('title') or entry.get('snippet', '无标题')
+            title = self.sanitize_filename(title)
+            if not title: title = f"无标题"
+            
+            date_str = time.strftime("%Y%m%d", time.localtime(entry['createDate']/1000))
+            target_dir = os.path.join(self.vault_root, self.sanitize_filename(folder_name))
+            
+            # 【重要优化】防止文件名冲突：添加 ID 后4位
+            filename = f"{date_str}_{title}_{str(nid)[-4:]}.md"
+            md_path = os.path.join(target_dir, filename)
+            
+            # 增量跳过
+            if os.path.exists(md_path) and os.path.getsize(md_path) > 0:
+                self.log(f"    ⏭️ [跳过] {title}")
+                return 
 
-        content = full_note.get('content', '')
-        
-        if not os.path.exists(target_dir): 
-            os.makedirs(target_dir, exist_ok=True)
-        
-        # 5. 资源提取与下载
-        ids = set()
-        ids.update(re.findall(r'fileid=["\']?([\w\.\-]+)["\']?', content, re.I))
-        ids.update(re.findall(r'☺\s*([\w\.\-]+)', content))
-        ids.update(re.findall(r'<fileId:(\d+)', content))
-        ids.update(re.findall(r'<sound[^>]+fileid=["\']?([\w\.\-]+)["\']?', content, re.I))
-        
-        voice_list = extra.get('voice_list') or extra.get('audio_list') or []
-        voice_ids = [v['fileId'] for v in voice_list if v.get('fileId')]
-        ids.update(voice_ids)
-        
-        if full_note.get('setting'):
+            full_note = self.fetch_note_detail(nid)
+            if not full_note:
+                self.log(f"    ⚠️ [失败] 无法获取详情: {title}")
+                return
+
+            content = full_note.get('content', '')
+            if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
+            
+            # --- 资源提取逻辑 ---
+            ids = set()
+            ids.update(re.findall(r'fileid=["\']?([\w\.\-]+)["\']?', content, re.I))
+            ids.update(re.findall(r'☺\s*([\w\.\-]+)', content))
+            ids.update(re.findall(r'<fileId:(\d+)', content))
+            ids.update(re.findall(r'<sound[^>]+fileid=["\']?([\w\.\-]+)["\']?', content, re.I))
+            
+            voice_list = extra.get('voice_list') or extra.get('audio_list') or []
+            voice_ids = [v['fileId'] for v in voice_list if v.get('fileId')]
+            ids.update(voice_ids)
+            
+            if full_note.get('setting'):
+                try:
+                    for res in json.loads(full_note.get('setting', '{}')).get('data', []):
+                        if res.get('fileId'): ids.add(res.get('fileId'))
+                except: pass
+
+            replacements = {}
+            for fid in ids:
+                if self.stop_flag: return
+                fname = self.download_resource(fid)
+                if fname: replacements[fid] = f"![[{fname}]]"
+
+            # --- 内容替换 ---
+            content = self.clean_content(content)
+            for fid, link in replacements.items():
+                content = re.sub(fr'<sound[^>]*{re.escape(fid)}[^>]*\/?>', f"\n{link}\n", content)
+                content = re.sub(fr'<[^>]*{re.escape(fid)}[^>]*>', f"\n{link}\n", content)
+                content = re.sub(fr'☺\s*{re.escape(fid)}.*', f"\n{link}\n", content)
+                content = content.replace(f"<fileId:{fid}>", f"\n{link}\n")
+                content = content.replace(f"<fileId:{fid}/>", f"\n{link}\n")
+
+            if voice_ids:
+                appended = False
+                for vid in voice_ids:
+                    if vid not in content and vid in replacements:
+                        if not appended:
+                            content += "\n\n---\n**🎙️ 附件录音：**\n"
+                            appended = True
+                        content += f"{replacements[vid]}\n"
+
+            # --- 文件写入 ---
+            ctime_struct = time.localtime(full_note['createDate']/1000)
+            mtime_struct = time.localtime(full_note['modifyDate']/1000)
+            ctime_str = time.strftime("%Y-%m-%d %H:%M:%S", ctime_struct)
+            mtime_str = time.strftime("%Y-%m-%d %H:%M:%S", mtime_struct)
+            
+            md_text = f"---\nid: {nid}\ncreated: {ctime_str}\nupdated: {mtime_str}\ntitle: \"{title}\"\nfolder: \"{folder_name}\"\nauthor: Ning\n---\n\n# {title}\n\n{content}\n"
+            
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(md_text)
+                
+            # --- 时间戳修改 ---
             try:
-                for res in json.loads(full_note.get('setting', '{}')).get('data', []):
-                    if res.get('fileId'): ids.add(res.get('fileId'))
+                mtime_ts = full_note['modifyDate'] / 1000.0
+                os.utime(md_path, (mtime_ts, mtime_ts))
             except: pass
 
-        replacements = {}
-        for fid in ids:
-            fname = download_resource(fid)
-            if fname:
-                replacements[fid] = f"![[{fname}]]"
-
-        # 6. 内容深度清洗与替换
-        content = clean_content(content) # 使用新的清洗函数
-        
-        for fid, link in replacements.items():
-            content = re.sub(fr'<sound[^>]*{re.escape(fid)}[^>]*\/?>', f"\n{link}\n", content)
-            content = re.sub(fr'<[^>]*{re.escape(fid)}[^>]*>', f"\n{link}\n", content)
-            content = re.sub(fr'☺\s*{re.escape(fid)}.*', f"\n{link}\n", content)
-            content = content.replace(f"<fileId:{fid}>", f"\n{link}\n")
-            content = content.replace(f"<fileId:{fid}/>", f"\n{link}\n")
-
-        if voice_ids:
-            appended = False
-            for vid in voice_ids:
-                if vid not in content and vid in replacements:
-                    if not appended:
-                        content += "\n\n---\n**🎙️ 附件录音：**\n"
-                        appended = True
-                    content += f"{replacements[vid]}\n"
-
-        # 7. 生成 Markdown 文件
-        ctime_struct = time.localtime(full_note['createDate']/1000)
-        mtime_struct = time.localtime(full_note['modifyDate']/1000)
-        ctime_str = time.strftime("%Y-%m-%d %H:%M:%S", ctime_struct)
-        mtime_str = time.strftime("%Y-%m-%d %H:%M:%S", mtime_struct)
-        
-        md_text = f"---\nid: {nid}\ncreated: {ctime_str}\nupdated: {mtime_str}\ntitle: \"{title}\"\nfolder: \"{folder_name}\"\nauthor: Ning\n---\n\n# {title}\n\n{content}\n"
-        
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(md_text)
+            self.log(f"    ✅ [成功] {title}")
             
-        # 8. 【核心修复】强制修改文件系统时间戳
-        # 解决 Issue #2: "定格都是创建日期"
-        try:
-            mtime_timestamp = full_note['modifyDate'] / 1000.0
-            # os.utime(path, (access_time, modification_time))
-            os.utime(md_path, (mtime_timestamp, mtime_timestamp))
         except Exception as e:
-            pass # 时间戳修改失败不影响文件内容，静默处理
+            self.log(f"    ❌ [错误] 处理笔记 {nid} 失败: {e}")
 
-        print(f"    ✅ [同步成功] [{folder_name}] {title}")
-        
-    except Exception as e:
-        print(f"    ❌ [错误] 处理笔记 {entry.get('id', 'Unknown')} 失败: {e}")
-
+# CLI 入口兼容
 def main():
-    print(f"🚀 MiNote Sync Pro - By Ning (v1.1.0 Robust)")
-    setup_dirs()
-    
-    notes_list, folder_map = fetch_note_list()
-    if not notes_list: 
-        print("⚠️ 未发现笔记或 Cookie 失效")
-        return
-
-    print(f"📦 发现云端笔记 {len(notes_list)} 条，准备开始同步...")
-    print(f"⚙️  线程池模式 (Max Workers: 4) - 降低并发以提高稳定性")
-    
-    # 降低并发数，配合重试机制，确保稳定性
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        pool.map(process_single_note, [(n, folder_map) for n in notes_list])
-        
-    print(f"\n🎉 全部同步完成！数据已保存至: {VAULT_ROOT}")
+    print("请运行 gui.py 或自行调用 MiNoteSyncCore 类")
 
 if __name__ == "__main__":
     main()
