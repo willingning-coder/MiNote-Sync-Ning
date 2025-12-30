@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-MiNote Sync GUI - 小米笔记同步助手 (v1.1.0)
+MiNote Sync GUI - 小米笔记同步助手 (v1.3.0)
 Author: Ning (willingning-coder)
 Date: 2025-12-29
 """
@@ -23,12 +23,12 @@ from main import MiNoteSyncCore
 class MiNoteGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("MiNote Sync Pro - 小米笔记同步助手 v1.2.0")
-        self.root.geometry("850x650")
+        self.root.title("MiNote Sync Pro - 小米笔记同步助手 v1.3.0")
+        self.root.geometry("850x700") # 稍微调高一点
         
         self.config_file = "config.json"
         self.log_queue = queue.Queue()
-        self.core_instance = None # 核心实例
+        self.core_instance = None
         self.is_running = False
         
         self.load_config()
@@ -46,13 +46,22 @@ class MiNoteGUI:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     self.config = json.load(f)
             else:
-                self.config = {"cookie": "", "path": os.path.join(os.getcwd(), "Data", "Notes")}
+                self.config = {
+                    "cookie": "", 
+                    "path": os.path.join(os.getcwd(), "Data", "Notes"),
+                    "use_date_prefix": True
+                }
         except:
-            self.config = {"cookie": "", "path": os.path.join(os.getcwd(), "Data", "Notes")}
+            self.config = {
+                "cookie": "", 
+                "path": os.path.join(os.getcwd(), "Data", "Notes"),
+                "use_date_prefix": True
+            }
             
     def save_config(self):
         self.config["cookie"] = self.cookie_var.get()
         self.config["path"] = self.path_var.get()
+        self.config["use_date_prefix"] = self.date_prefix_var.get()
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -88,7 +97,14 @@ class MiNoteGUI:
         self.path_var = tk.StringVar(value=self.config.get("path", ""))
         ttk.Entry(row2, textvariable=self.path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(row2, text="📂 浏览...", command=self.browse_path).pack(side=tk.LEFT)
-        
+
+        # 【新增】高级选项
+        row3 = ttk.Frame(config_frame)
+        row3.pack(fill=tk.X, pady=5)
+        self.date_prefix_var = tk.BooleanVar(value=self.config.get("use_date_prefix", True))
+        # Checkbox 允许用户选择是否在文件名中包含日期
+        ttk.Checkbutton(row3, text="文件名包含日期前缀 (例如: 20250101_标题.md)", variable=self.date_prefix_var).pack(side=tk.LEFT, padx=50)
+
         # --- 控制区 ---
         ctrl_frame = ttk.Frame(main_frame, padding="10")
         ctrl_frame.pack(fill=tk.X)
@@ -167,9 +183,11 @@ class MiNoteGUI:
         try:
             self.log("🚀 初始化核心同步引擎...")
             # 实例化核心类，传入 self.log 作为回调
+            # 【重要】传入 use_date_prefix 参数
             self.core_instance = MiNoteSyncCore(
                 cookie=self.cookie_var.get(),
                 save_path=self.path_var.get(),
+                use_date_prefix=self.date_prefix_var.get(), # 从界面获取配置
                 log_callback=self.log
             )
             
@@ -181,16 +199,11 @@ class MiNoteGUI:
                 self.log("⚠️ 未获取到笔记，任务结束。")
             else:
                 self.log(f"📦 开始处理 {len(notes)} 条笔记 (4线程并发)...")
-                # 线程池执行
                 with ThreadPoolExecutor(max_workers=4) as pool:
-                    # 使用 map 可以按顺序提交，但这里我们需要随时检查 stop_flag
-                    # 也可以直接提交所有任务，但在 task 内部检查 stop_flag
                     futures = [pool.submit(self.core_instance.process_single_note, (n, folders)) for n in notes]
-                    
-                    # 等待所有任务完成
                     for f in futures:
                         if self.core_instance.stop_flag: break
-                        f.result() # 这里的异常已被内部捕获
+                        f.result()
                         
             self.log("🎉 任务流程结束。")
             
