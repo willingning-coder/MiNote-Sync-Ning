@@ -3,13 +3,13 @@
 Project: MiNote-Sync Core (核心逻辑库)
 Author: Ning (willingning-coder)
 Date: 2025-12-29
-Version: 1.2.1 (Hotfix)
+Version: 1.3.0 (User-Configurable Edition)
 
 Changelog:
-    v1.2.1:
-      - 修复: 移除 YAML Frontmatter 中硬编码的 "author: Ning"。
-      - 修复: 增加针对 "text indent" 等 CSS 残留代码的清洗逻辑。
-      - 优化: 标题生成时同步清洗垃圾代码，防止文件名出现代码。
+    v1.3.0:
+      - 新增: 文件名命名规则可配置（可选是否添加日期前缀）。
+      - 修复: 强制去除 Cookie 中的换行符，解决 Invalid header value 报错。
+      - 优化: 标题生成前优先清洗 CSS 垃圾词，防止文件名污染。
 """
 
 import json
@@ -22,10 +22,19 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 
 class MiNoteSyncCore:
-    def __init__(self, cookie, save_path, log_callback=None):
-        self.cookie = cookie
+    def __init__(self, cookie, save_path, use_date_prefix=True, log_callback=None):
+        """
+        :param use_date_prefix: Boolean, True=文件名带日期, False=仅标题
+        """
+        # 【修复】强制清洗 Cookie，去除回车换行，防止 header 报错
+        if cookie:
+            self.cookie = cookie.replace('\n', '').replace('\r', '').strip()
+        else:
+            self.cookie = ""
+            
         self.vault_root = save_path
         self.assets_dir = os.path.join(save_path, "assets")
+        self.use_date_prefix = use_date_prefix # 新增配置项
         self.log_callback = log_callback or print
         self.stop_flag = False
 
@@ -71,50 +80,31 @@ class MiNoteSyncCore:
         if not os.path.exists(self.assets_dir): os.makedirs(self.assets_dir)
 
     def clean_css_garbage(self, text):
-        """【新增】专门处理 CSS 样式残留和特定垃圾词"""
+        """【加强版】专门处理 CSS 样式残留"""
         if not text: return ""
-        # 去除 "text indent=1" 或 "text indent=1cpu" 这种连体怪
-        # 逻辑：匹配 text indent=数字，可能后面紧跟字符
-        text = re.sub(r'text\s*indent\s*=\s*\d+', '', text, flags=re.IGNORECASE)
-        # 去除常见的 class 定义残留
+        # 针对 text indent=1cpu 这种连体怪进行更宽泛的匹配
+        # 匹配 text indent= 后面跟着的一串非空字符
+        text = re.sub(r'text\s*indent\s*=\s*\S+', '', text, flags=re.IGNORECASE)
         text = re.sub(r'class="[^"]+"', '', text)
         text = re.sub(r'style="[^"]+"', '', text)
-        return text
+        return text.strip()
 
     def sanitize_filename(self, name):
         if not name: return "未命名"
-        
-        # 1. 先清洗垃圾代码，防止文件名里带代码
-        name = self.clean_css_garbage(name)
-        
-        # 2. 常规文件系统清洗
+        name = self.clean_css_garbage(name) # 先洗代码
         name = re.sub(r'[\x00-\x1f]', '', name)
         name = re.sub(r'[\\/*?:"<>|]', "", name).replace('\n', ' ').strip()
-        
-        # 3. 长度控制 (Windows 路径保护)
         return name[:50]
 
     def clean_content(self, content):
-        """HTML/XML 深度清洗"""
         if not content: return ""
-        
-        # 1. 结构化替换
         content = content.replace("<br>", "\n").replace("<br/>", "\n")
         content = content.replace("</div>", "\n").replace("</p>", "\n")
-        
-        # 2. 移除特定干扰标签保留内容
         content = re.sub(r'<text[^>]*>(.*?)</text>', r'\1', content, flags=re.S)
         content = re.sub(r'<background[^>]*>(.*?)</background>', r'\1', content, flags=re.S)
-        
-        # 3. 暴力移除标签
         content = re.sub(r'<[^>]+>', '', content)
-        
-        # 4. 【新增】CSS 垃圾词清洗
-        content = self.clean_css_garbage(content)
-        
-        # 5. 实体解码
+        content = self.clean_css_garbage(content) # CSS 清洗
         content = html.unescape(content)
-        
         return content.strip()
 
     def get_real_extension(self, response):
@@ -208,16 +198,23 @@ class MiNoteSyncCore:
             try: extra = json.loads(entry.get('extraInfo', '{}'))
             except: pass
             
-            # 1. 提取标题
-            title = extra.get('title') or entry.get('snippet', '无标题')
-            # 【重要】标题也要进行深度清洗，防止 "text indent" 出现在文件名里
-            title = self.sanitize_filename(title)
+            # 1. 提取标题并【立刻清洗】
+            raw_title = extra.get('title') or entry.get('snippet', '无标题')
+            # 这里的清洗非常关键，确保 text indent 不会进入文件名
+            title = self.sanitize_filename(raw_title)
             if not title: title = "无标题"
             
-            date_str = time.strftime("%Y%m%d", time.localtime(entry['createDate']/1000))
             target_dir = os.path.join(self.vault_root, self.sanitize_filename(folder_name))
             
-            filename = f"{date_str}_{title}_{str(nid)[-4:]}.md"
+            # 2. 【核心修改】根据用户配置决定文件名格式
+            if self.use_date_prefix:
+                date_str = time.strftime("%Y%m%d", time.localtime(entry['createDate']/1000))
+                # 格式: 20250101_标题_ID后4位.md
+                filename = f"{date_str}_{title}_{str(nid)[-4:]}.md"
+            else:
+                # 格式: 标题_ID后4位.md (ID后缀必须保留，否则重名笔记会覆盖)
+                filename = f"{title}_{str(nid)[-4:]}.md"
+                
             md_path = os.path.join(target_dir, filename)
             
             if os.path.exists(md_path) and os.path.getsize(md_path) > 0:
@@ -232,7 +229,7 @@ class MiNoteSyncCore:
             content = full_note.get('content', '')
             if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
             
-            # --- 资源提取 ---
+            # --- 资源提取 (省略，逻辑不变) ---
             ids = set()
             ids.update(re.findall(r'fileid=["\']?([\w\.\-]+)["\']?', content, re.I))
             ids.update(re.findall(r'☺\s*([\w\.\-]+)', content))
@@ -273,13 +270,12 @@ class MiNoteSyncCore:
                             appended = True
                         content += f"{replacements[vid]}\n"
 
-            # --- 文件写入 (移除了 author) ---
+            # --- 文件写入 ---
             ctime_struct = time.localtime(full_note['createDate']/1000)
             mtime_struct = time.localtime(full_note['modifyDate']/1000)
             ctime_str = time.strftime("%Y-%m-%d %H:%M:%S", ctime_struct)
             mtime_str = time.strftime("%Y-%m-%d %H:%M:%S", mtime_struct)
             
-            # 【修复】移除了 author: Ning
             md_text = f"---\nid: {nid}\ncreated: {ctime_str}\nupdated: {mtime_str}\ntitle: \"{title}\"\nfolder: \"{folder_name}\"\n---\n\n{content}\n"
             
             with open(md_path, "w", encoding="utf-8") as f:
